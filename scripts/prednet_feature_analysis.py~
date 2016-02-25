@@ -1,0 +1,788 @@
+import pdb, sys, traceback, os, time, theano
+
+import pickle as pkl
+from prednet_GAN import create_feature_fxn, extract_model_features
+from keras_models import initialize_model
+def_dir = os.path.expanduser('~/default_dir')
+sys.path.insert(0,def_dir)
+from basic_fxns import *
+cname = get_computer_name()
+sys.path.append(get_scripts_dir() +'General_Scripts/')
+import general_python_functions as gp
+from general_python_functions import libsvm_classify
+import hickle as hkl
+import numpy as np
+import sklearn as sk
+import sklearn.cross_validation as skcv
+import sklearn.linear_model as sklm
+import matplotlib.pyplot as plt
+import sklearn.manifold as skm
+
+sys.path.append('/home/bill/Libraries/keras/')
+from keras.models import standardize_X, slice_X, make_batches
+
+sys.path.append('/home/bill/Dropbox/Research/General_Python/')
+from tsne import tsne
+
+
+
+def get_feature_params(param_overrides=None):
+
+	base_save_dir = '/home/bill/Projects/Predictive_Networks/facegen_feature_runs/'
+	P = {}
+	P['model_name'] = 'facegen_rotation_prednet_twolayer'
+	P['model_params'] = {'n_timesteps': 5, 'batch_size': 6, 'num_filt': 64, 'use_encoder_drop0': False, 'use_encoder_drop1': False, 'use_dense_drop': False}
+	P['weights_file'] =    '/home/bill/Projects/Predictive_Networks/facegen_runs_server/run_57/model_best_weights.hdf5' #'/home/bill/Projects/Predictive_Networks/facegen_runs/run_19/model_weights.hdf5'
+	P['feature_layer_names'] = ['pool0', 'pool1', 'RNN']
+	P['feature_is_time_expanded'] = [True, False]
+	P['batch_size'] = P['model_params']['batch_size']
+	P['data_file'] = '/home/bill/Data/FaceGen_Rotations/clipset4/clipstrain.hkl'
+	P['calculate_idx'] = range(4000)
+	P['input_nt'] = 5
+	P['run_num'] = gp.get_next_run_num(base_save_dir)
+	P['save_dir'] = base_save_dir + 'run_' + str(P['run_num']) + '/'
+
+	if param_overrides is not None:
+		for d in param_overrides:
+			P[d] = param_overrides[d]
+
+	return P
+
+
+def get_decoding_params(param_overrides=None):
+
+	base_save_dir = '/home/bill/Projects/Predictive_Networks/facegen_feature_fit_runs/'
+	P = {}
+	P['feature_run_num'] = 4
+	P['layers_to_use'] = ['RNN']
+	P['layer_outputs_to_use'] = [range(5), [0]]
+	P['timesteps_to_use'] = range(5)
+	P['to_decode'] = ['pca_1']
+	P['fit_model'] = 'ridge'
+	P['model_params'] = [1e3,1e2,1,.1,1e-2]  #ordered from most regularization to least
+	P['params_selection_method'] = 'best'
+	P['params_file'] = '/home/bill/Data/FaceGen_Rotations/clipset4/all_params_train.pkl'
+	P['n_splits'] = 5
+	P['train_prop'] = 0.75
+	P['run_num'] = gp.get_next_run_num(base_save_dir)
+	P['save_dir'] = base_save_dir + 'run_' + str(P['run_num']) + '/'
+
+	if param_overrides is not None:
+		for d in param_overrides:
+			P[d] = param_overrides[d]
+
+	return P
+
+
+def get_decoding_params_old(param_overrides=None):  #how old decoding params looked
+
+	base_save_dir = '/home/bill/Projects/Predictive_Networks/facegen_feature_fit_runs/'
+	P = {}
+	P['feature_run_num'] = 4
+	P['layers_to_use'] = ['RNN']
+	P['layer_outputs_to_use'] = [range(5), [0]]
+	P['timesteps_to_use'] = range(5)
+	P['to_decode'] = ['pca_1']
+	P['fit_model'] = 'ridge'
+	P['model_params'] = [1e3,1e2,1,.1,1e-2]  #ordered from most regularization to least
+	P['params_selection_method'] = 'best'
+	P['params_file'] = '/home/bill/Data/FaceGen_Rotations/clipset4/all_params_train.pkl'
+	P['n_splits'] = 5
+	P['train_prop'] = 0.75
+	P['run_num'] = gp.get_next_run_num(base_save_dir)
+	P['save_dir'] = base_save_dir + 'run_' + str(P['run_num']) + '/'
+
+	if param_overrides is not None:
+		for d in param_overrides:
+			P[d] = param_overrides[d]
+
+	return P
+
+
+def get_run_dir(run_num, is_server):
+
+	run_dir = '/home/bill/Projects/Predictive_Networks/facegen_runs'
+	if is_server:
+		run_dir = run_dir+'_server/'
+	else:
+		run_dir = run_dir+'/'
+	run_dir = run_dir+'run_'+str(run_num)+'/'
+	return run_dir
+
+
+def run_run_full_decoding():
+
+	run_num = 67
+	is_server = True
+	epochs_to_calc = range(150)
+
+	run_dir = get_run_dir(run_num, is_server)
+
+	for e in epochs_to_calc:
+		print 'Running epoch: '+str(e)
+		weights_file = run_dir+'model_weights_epoch'+str(e)+'.hdf5'
+		save_dir = run_dir + 'feature_analysis_epoch'+str(e)+'/'
+		run_full_decoding_analysis(weights_file, save_dir, extract_features=True, fit_features=True)
+
+
+def run_full_decoding_analysis(weights_file, save_dir, extract_features=True, fit_features=True):
+
+	if not os.path.exists(save_dir):
+		os.mkdir(save_dir)
+
+	if extract_features:
+		po = {}
+		po['model_name'] = 'facegen_rotation_prednet_twolayer'
+		po['model_params'] = {'n_timesteps': 5, 'batch_size': 6, 'num_filt': 64, 'use_encoder_drop0': False, 'use_encoder_drop1': False, 'use_dense_drop': False}
+		po['weights_file'] = weights_file
+		po['feature_layer_names'] = ['pool0', 'pool1', 'RNN'] #, 'fc_decoder_relu', 'deconv1_relu']
+		po['timesteps_to_use'] = [0, 0, None] #, None, None]
+		po['feature_is_time_expanded'] = [True, True, False] #, False, False]
+		po['batch_size'] = po['model_params']['batch_size']
+		po['data_file'] = '/home/bill/Data/FaceGen_Rotations/clipset5/clipsall.hkl'
+		po['calculate_idx'] = range(4000)
+		po['input_nt'] = 5
+		po['run_num'] = -1
+		po['save_dir'] = save_dir+'features/'
+
+		run_extract_features(po)
+
+	if fit_features:
+
+		po = {}
+		po['layers_to_use'] = ['pool0', 'pool1', 'RNN'] #['pool0', 'pool1', 'RNN', 'fc_decoder_relu', 'deconv1_relu']
+		po['layer_outputs_to_use'] = [[0], [0], range(5)] #[[0], [0], range(5), [0], [0]]
+		po['timesteps_to_use'] = [[0], [0], range(5)]  #[[0], [0], range(5), [-1], [-1]]
+		po['to_decode'] = ['pca_1', 'pca_2', 'pca_3', 'pca_4', 'pca_5', 'pan_initial_angles', 'pan_angular_speeds']
+		po['fit_model'] = 'ridge'
+		po['model_params'] = {'method': 'adaptive', 'start_list': [1e3,1e2,1,.1,1e-2], 'max_param': 1e5, 'min_param': 1e-5}  #ordered from most regularization to least
+		po['ntrain'] = 2000
+		po['nval'] = 1000
+		po['ntest'] = 1000
+		po['params_selection_method'] = 'best'
+		po['params_file'] = '/home/bill/Data/FaceGen_Rotations/clipset5/all_params_all.pkl'
+		po['run_num'] = -1
+		po['save_dir'] = save_dir+'decoding/'
+
+		f = open(save_dir+'features/params.pkl','r')
+		P_feature = pkl.load(f)
+		f.close()
+
+		run_fit_features(param_overrides=po, P_feature=P_feature)
+
+
+
+def run_make_feature_hists():
+
+	run_num = 67
+	is_server = True
+	epochs_to_plot = [0,5,20,50]
+	stats = ['norm', 'sparcity']
+
+	layer = 'RNN'
+	layer_output_num = 0
+	t_step = 4
+
+	for e in epochs_to_plot:
+		for s in stats:
+			make_feature_stat_hist(run_num, is_server, e, layer, layer_output_num, t_step, s)
+
+
+def make_feature_stat_hist(run_num, is_server, epoch, layer, layer_output_num, t_step, stat_name, decode_var=None):
+
+	run_dir = get_run_dir(run_num, is_server)
+	save_dir = run_dir+'decoding_plots/'
+
+	features = load_features(run_num, is_server, epoch, layer)
+	features = features[layer_output_num][:,t_step]
+
+	if stat_name=='norm':
+		vals = np.linalg.norm(features, axis=1)
+	elif stat_name=='sparcity':
+		vals = np.zeros(features.shape[0])
+		for i in range(features.shape[0]):
+			vals[i] = np.mean(features[i]==0.0)
+	elif 'corr' in stat_name:
+		y = load_params(decode_var)
+		vals = np.zeros(features.shape[0])
+		for i in range(features.shape[0]):
+			if state_name=='corr':
+				vals[i] = np.corrceof(vals[i], y)
+
+
+	plt.figure()
+	plt.hist(vals, normed=True)
+	plt.xlabel(stat_name)
+	plt.ylabel('Proportion')
+	plt.title('Distribution of '+stat_name+' for layer='+layer+',outnum='+str(layer_output_num)+',t='+str(t_step)+',epoch='+str(epoch))
+	plt.savefig(save_dir+'Hist_'+stat_name+'_'+layer+'_output'+str(layer_output_num)+'_t'+str(t_step)+'_epoch'+str(epoch)+'.tif')
+
+
+
+def run_make_epoch_plots():
+
+	run_num = 67
+	is_server = True
+	epochs_to_plot = [0,5,10,20,50]
+
+	make_decoding_by_epoch_plots(run_num, is_server, epochs_to_plot)
+
+
+
+
+def make_decoding_by_epoch_plots(run_num, is_server, epochs_to_plot):
+
+	run_dir = get_run_dir(run_num, is_server)
+	save_dir = run_dir+'decoding_plots/'
+	if not os.path.exists(save_dir):
+		os.mkdir(save_dir)
+
+	layers = ['pool0', 'pool1', 'RNN', 'fc_decoder_relu', 'deconv1_relu', 'RNN']
+	layer_output_nums = [0, 0, 0, 0, 0, 0]
+	timesteps_to_use = [0, 0, 0, -1, -1, 4]
+	decode_vars = ['pca_1', 'pca_2', 'pca_3', 'pca_4', 'pca_5', 'genders', 'ages', 'pan_angular_speeds', 'pan_initial_angles']
+
+	all_scores = {}
+	for d in decode_vars:
+		all_scores[d] = np.zeros( (len(epochs_to_plot), len(layers)) )
+
+	for e_idx,e in enumerate(epochs_to_plot):
+		this_dir = run_dir + 'feature_analysis_epoch'+str(e)+'/decoding/'
+		these_scores = pkl.load( open(this_dir+'test_scores.pkl','r'))
+		for i in range(len(layers)):
+			for feat in decode_vars:
+				tup = (layers[i], layer_output_nums[i], timesteps_to_use[i], feat)
+				all_scores[feat][e_idx, i] = these_scores[tup]
+
+
+	for d in decode_vars:
+		plt.figure()
+		plt.plot(epochs_to_plot,all_scores[d])
+		plt.legend(layers, loc=0)
+		plt.ylabel('Decoding Performace')
+		plt.xlabel('Epoch')
+		plt.savefig(save_dir+'Decoding_by_epoch_'+d+'.tif')
+
+
+def run_tsne_plot():
+
+	run_num = 67
+	is_server = True
+	epochs = [0,5,10,50]
+
+	layer = 'RNN'
+	layer_output_num = 0
+	t_step = 4
+
+	#for epoch in [0,10,50]:
+	make_tsne_plot(run_num, is_server, epochs, layer, layer_output_num, t_step, is_mds=False)
+
+
+
+def load_features(run_num, is_server, epoch, layer):
+
+	run_dir = get_run_dir(run_num, is_server)
+	f_name = run_dir+'feature_analysis_epoch'+str(epoch)+'/features/'+layer+'_features.hkl'
+	feats = hkl.load(open(f_name, 'r'))
+
+	return feats
+
+
+def load_params(feat):
+
+	f_name = '/home/bill/Data/FaceGen_Rotations/clipset5/all_params_all.pkl'
+	params_dict = pkl.load(open(f_name,'r'))
+
+	if 'pca' in feat:
+		idx = int(feat[feat.find('_')+1:])
+		y = params_dict['pca_basis']
+		y = y[:,idx]
+	elif feat=='genders_binary':
+		y = params_dict['genders']>0
+		y = y.astype(int)
+	else:
+		y = params_dict[feat]
+
+	return feat
+
+
+def make_tsne_plot(run_num, is_server, epochs, layer, layer_output_num, t_step, n_plot=500, is_mds=False):
+
+	run_dir = get_run_dir(run_num, is_server)
+	save_dir = run_dir+'decoding_plots/'
+
+	for i,epoch in enumerate(epochs):
+		f_name = run_dir+'feature_analysis_epoch'+str(epoch)+'/features/'+layer+'_features.hkl'
+		feats = hkl.load(open(f_name, 'r'))
+		feats = feats[layer_output_num][:,t_step]
+		if i==0:
+			idx = np.random.permutation(feats.shape[0])[:n_plot]
+		feats = feats[idx].astype(np.float64)
+		feats = feats.reshape((n_plot, np.prod(feats.shape[1:])))
+		if i==0:
+			features = feats
+		else:
+			features = np.vstack((features, feats))
+
+	params_file = '/home/bill/Data/FaceGen_Rotations/clipset5/all_params_all.pkl'
+	params_dict = pkl.load(open(params_file, 'r'))
+
+	var = {}
+	var['speed'] = params_dict['pan_angular_speeds'][idx]
+	var['angle0'] = params_dict['pan_initial_angles'][idx]
+	var['pca_1'] = params_dict['pca_basis'][idx][:,0]
+
+	if is_mds:
+		clf = skm.MDS()
+		X = clf.fit_transform(features)
+	else:
+		X = tsne(features)
+	x_min = np.min(X[:,0])
+	x_max = np.max(X[:,0])
+	y_min = np.min(X[:,1])
+	y_max = np.max(X[:,1])
+	for i,epoch in enumerate(epochs):
+		X_plot = X[i*n_plot:(i+1)*n_plot]
+		for v in var:
+			# c = np.zeros((n_plot, 3))
+			# m = 0.8/(np.max(var[v])-np.min(var[v]))
+			# c0 = 0.1 - m*np.min(var[v])
+			# for i in range(n_plot):
+			# 	c[i,0] = var[v][i]*m+c0
+			plt.figure()
+			plt.scatter(X_plot[:,0], X_plot[:,1], s=30, c=var[v], cmap='bwr')
+			plt.ylim([y_min-5,y_max+5])
+			plt.xlim([x_min-5,x_max+5])
+			if is_mds:
+				s = 'MDS'
+			else:
+				s = 'tSNE'
+			plt.savefig(save_dir+s+'_plot_'+layer+'_output'+str(layer_output_num)+'_t'+str(t_step)+'_'+v+'_epoch'+str(epoch)+'.tif')
+
+
+def run_RNN_heatmap():
+
+	run_num = 67
+	is_server = True
+	epochs = [0,5,10,50]
+
+	decode_var = 'pca_5'
+
+	for e in epochs:
+		make_RNN_decoding_heatmap(run_num, is_server, e, decode_var)
+
+
+def make_RNN_decoding_heatmap(run_num, is_server, epoch, decode_var):
+
+	run_dir = get_run_dir(run_num, is_server)
+	save_dir = run_dir+'decoding_plots/'
+	this_dir = run_dir + 'feature_analysis_epoch'+str(epoch)+'/decoding/'
+
+	t_steps = range(0,5)
+	nouts = 5
+	all_scores = np.zeros((len(t_steps), nouts))
+
+	these_scores = pkl.load( open(this_dir+'test_scores.pkl','r'))
+	for ti,t in enumerate(t_steps):
+		for l in range(nouts):
+			tup = ('RNN', l, t, decode_var)
+			all_scores[ti,l] = these_scores[tup]
+
+	plt.figure()
+	ax = plt.gca()
+	plt.imshow(all_scores, interpolation='none')
+	plt.ylabel('t')
+	plt.xlabel('output num')
+	plt.yticks(range(len(t_steps)))
+	ax.set_yticklabels(t_steps)
+	plt.xticks(range(5))
+	ax.set_xticklabels(['h','c', 'i', 'f','o'])
+	plt.colorbar(cmap='Greys')
+
+	plt.savefig(save_dir+'RNN_decoding_heatmap_'+decode_var+'_epoch'+str(epoch)+'.tif')
+
+
+
+def load_feature_params(run_num, base_save_dir = '/home/bill/Projects/Predictive_Networks/facegen_feature_runs/'):
+
+	f = open(base_save_dir+'run_'+str(run_num)+'/params.pkl', 'r')
+	P = pkl.load(f)
+	f.close()
+
+	return P
+
+
+def run_extract_features(param_overrides=None):
+
+	P = get_feature_params(param_overrides)
+
+	f = open(P['data_file'], 'r')
+	X = hkl.load(f)
+	f.close()
+	X = X[P['calculate_idx']]
+	X_flat = X.reshape((X.shape[0], X.shape[1], X.shape[2]*X.shape[3]*X.shape[4]))
+
+	data = {'input_frames': X_flat[:,:P['input_nt']]}
+
+	model = initialize_model(P['model_name'], P['model_params'])
+	model.load_weights(P['weights_file'])
+
+	for i,feat in enumerate(P['feature_layer_names']):
+		print 'Computing features for '+feat
+		print '   Compiling...'
+		if 'RNN' in feat:
+			model.nodes[feat].return_sequences = True
+			feature_fxn = create_LSTM_feature_fxn(model, feat)
+			model.nodes[feat].return_sequences = False
+		else:
+			feature_fxn = create_feature_fxn(model, feat)
+
+		print '    Extracting features...'
+		features = extract_all_model_features(feature_fxn, model, data, P['batch_size'], P['feature_is_time_expanded'][i], P['input_nt'], P['timesteps_to_use'][i])
+
+		if i==0:
+			if not os.path.exists(P['save_dir']):
+				os.mkdir(P['save_dir'])
+
+			f = open(P['save_dir'] + 'params.pkl', 'w')
+			pkl.dump(P, f)
+			f.close()
+
+		f = open(P['save_dir']+feat+'_features.hkl', 'w')
+		hkl.dump(features, f)
+		f.close()
+
+
+
+def run_fit_features(param_overrides=None, P_feature=None):
+
+	P = get_decoding_params(param_overrides)
+
+	if P_feature is None:
+		P_feature = load_feature_params(P['feature_run_num'])
+
+	model_info, test_scores, cv_scores = fit_features2(P, P_feature)
+
+	if len(test_scores):
+
+		if not os.path.exists(P['save_dir']):
+			os.mkdir(P['save_dir'])
+		f = open(P['save_dir']+'model_info.pkl', 'w')
+		pkl.dump(model_info, f)
+		f.close()
+
+		f = open(P['save_dir']+'test_scores.pkl', 'w')
+		pkl.dump(test_scores, f)
+		f.close()
+
+		f = open(P['save_dir']+'cv_scores.pkl', 'w')
+		pkl.dump(cv_scores, f)
+		f.close()
+
+		f = open(P['save_dir']+'test_scores.txt', 'w')
+		for tup in test_scores:
+			f.write(str(tup)+': '+str(test_scores[tup]))
+			f.write("\n")
+		f.close()
+
+
+def fit_features2(P, P_feature):
+
+	f = open(P['params_file'], 'r')
+	params_dict = pkl.load(f)
+	f.close()
+
+	model_info = {}
+	test_scores = {}
+	cv_scores = {}
+
+	train_idx = np.array(range(P['ntrain']))
+	val_idx = P['ntrain']+np.array(range(P['nval']))
+	test_idx = P['ntrain']+P['nval']+np.array(range(P['ntest']))
+
+	for l_num, layer in enumerate(P['layers_to_use']):
+		f_name = P_feature['save_dir']+layer+'_features.hkl'
+		f = open(f_name, 'r')
+		features = hkl.load(f)
+		f.close()
+
+		for l_idx in P['layer_outputs_to_use'][l_num]:
+
+			for t in P['timesteps_to_use'][l_num]:
+
+				if t != -1:
+					X = features[l_idx][:,t]
+				else:
+					X = features[l_idx]
+				X = X.reshape( (X.shape[0], np.prod(X.shape[1:])))
+
+				X_train = X[train_idx]
+				X_val = X[val_idx]
+				X_test = X[test_idx]
+
+				for feat in P['to_decode']:
+					if 'pca' in feat:
+						idx = int(feat[feat.find('_')+1:])
+						y = params_dict['pca_basis']
+						y = y[:,idx]
+					elif feat=='genders_binary':
+						y = params_dict['genders']>0
+						y = y.astype(int)
+					else:
+						y = params_dict[feat]
+					y = y[P_feature['calculate_idx']]
+
+					y_train = y[train_idx]
+					y_val = y[val_idx]
+					y_test = y[test_idx]
+
+					tup = (layer, l_idx, t, feat)
+
+					if P['model_params']['method'] == 'adaptive':
+						these_scores = {}
+						p_list = P['model_params']['start_list']
+
+						while len(p_list)>0:
+
+							for C in p_list:
+								these_scores[C] = get_decoding_score(P['fit_model'], X_train, X_val, y_train, y_val, C)
+
+							p_list = []
+							all_params = np.array(these_scores.keys())
+							all_scores = np.array([these_scores[all_params[k]] for k in range(len(all_params))])
+							best_param = get_best_param(all_params, all_scores, P['params_selection_method'])
+
+							if best_param==all_params.min():
+								if all_params.min()>P['model_params']['min_param']:
+									p_list = [float(all_params.min())/10]
+							elif best_param==all_params.max():
+								if all_params.max()<P['model_params']['max_param']:
+									p_list = [float(all_params.max())*10]
+
+					print ' For '+str(tup)+':'
+					print '   shape: '+str(X_train.shape)
+					print '   best param: '+str(best_param)
+					cv_scores[tup] = these_scores
+					test_scores[tup], model_info[tup] = get_decoding_score(P['fit_model'], X_train, X_test, y_train, y_test, best_param, True)
+					print '   score: '+str(test_scores[tup])
+
+	return model_info, test_scores, cv_scores
+
+
+
+def get_decoding_score(model_name, X_train, X_test, y_train, y_test, C, return_params=False):
+
+	if 'svm' in model_name:
+		X = np.vstack( (X_train, X_test) )
+		y = np.concatenate( (y_train, y_test) )
+		train_idx = range(X_train.shape[0])
+		test_idx = range(X_train.shape[0], X.shape[0])
+		if model_name=='svm':
+			res = libsvm_classify(X, y, train_idx, test_idx, is_kernel_mat = False, C = C, kernel_name = 'linear')
+		elif model_name=='svmr':
+			res = libsvm_classify(X_train, y_train, train_idx, test_idx, is_kernel_mat = False, C = c, kernel_name = 'linear', s=3)
+		score = res[0]
+		model_info = []
+	elif model_name=='ridge':
+		clf = sk.linear_model.Ridge(alpha=C)
+		clf.fit(X_train, y_train)
+		score = clf.score(X_test, y_test)
+		model_info = clf.get_params()
+
+	if return_params:
+		return score, model_info
+	else:
+		return score
+
+
+
+def get_best_param(C_vals, scores, selection_method):
+
+	idx = np.argsort(C_vals)[::-1]
+	C_vals = C_vals[idx]
+	scores = scores[idx]
+	if selection_method=='best':
+		best_param = C_vals[np.argmax(scores)]
+
+	return best_param
+
+
+def get_best_param2D(C_vals, scores, selection_method):
+
+	idx = np.argsort(C_vals)[::-1]
+	C_vals = C_vals[idx]
+	scores = scores[idx]
+	if selection_method=='best':
+		best_param = C_vals[np.argmax(scores.mean(axis=-1))]
+	elif params_selection_method=='1sd':
+		mean_scores = scores.mean(axis=-1)
+		best_score = np.max(mean_scores)
+		std_score = scores.std(axis=-1)
+		good = mean_scores>=(best_score+std_score)
+		idx = np.nonzero(good)[0][0]
+		pdb.set_trace()
+		best_param = C_vals[idx]
+
+	return best_param
+
+
+def fit_features(P, P_feature):
+
+	#data_dir = P['data_file'][:P['data_file'].rfind('/')]
+	#f_name = data_dir+'face_params.pkl'
+	f = open(P['params_file'], 'r')
+	params_dict = pkl.load(f)
+	f.close()
+
+	model_info = {}
+	test_scores = {}
+	cv_scores = {}
+
+	for l_num, layer in enumerate(P['layers_to_use']):
+		f_name = P_feature['save_dir']+layer+'_features.hkl'
+		f = open(f_name, 'r')
+		features = hkl.load(f)
+		f.close()
+
+		for l_idx in P['layer_outputs_to_use'][l_num]:
+
+			for t in P['timesteps_to_use']:
+
+				X = features[l_idx][:,t]
+				X = X.reshape( (X.shape[0], np.prod(X.shape[1:])))
+
+				for feat in P['to_decode']:
+					if 'pca' in feat:
+						idx = int(feat[feat.find('_')+1:])
+						y = params_dict['pca_basis'][P_feature['calculate_idx']]
+						y = y[:,idx]
+					elif feat=='genders_binary':
+						y = params_dict['genders']>0
+						y = y.astype(int)
+					else:
+						y = params_dict[feat][P_feature['calculate_idx']]
+
+					X_train, X_test, y_train, y_test = skcv.train_test_split(X, y, test_size=1-P['train_prop'])
+					pdb.set_trace()
+
+					if P['fit_model']=='mds':
+						if not os.path.exists(P['save_dir']):
+							os.mkdir(P['save_dir'])
+					else:
+
+						kf = skcv.KFold(X_train.shape[0], n_folds=P['n_splits'])
+
+
+						tup = (layer, l_idx, t, feat)
+						cv_scores[tup] = np.zeros( (len(P['model_params']), P['n_splits']) )
+						for c_idx, c in enumerate(P['model_params']):
+							for k, (train_idx, test_idx) in enumerate(kf):
+								if P['fit_model']=='svm':
+									res = libsvm_classify(X_train, y_train, train_idx, test_idx, is_kernel_mat = False, C = c, kernel_name = 'linear')
+									cv_scores[tup][c_idx, k] = res[0]
+								elif P['fit_model']=='svmr':
+									res = libsvm_classify(X_train, y_train, train_idx, test_idx, is_kernel_mat = False, C = c, kernel_name = 'linear', s=3)
+									cv_scores[tup][c_idx, k] = res[0]
+								else:
+									if P['fit_model']=='ridge':
+										clf = sk.linear_model.Ridge(alpha=c)
+									clf.fit(X_train[train_idx], y_train[train_idx])
+									cv_scores[tup][c_idx, k] = clf.score(X_train[test_idx], y_train[test_idx])
+						if P['params_selection_method']=='best':
+							best_param = P['model_params'][np.argmax(cv_scores[tup].mean(axis=-1))]
+						elif P['params_selection_method']=='1sd':
+							mean_scores = cv_scores[tup].mean(axis=-1)
+							best_score = np.max(mean_scores)
+							std_score = cv_scores[tup].mean(axis=-1)
+							good = mean_scores>=(best_score+std_score)
+							idx = np.nonzero(good)[0][0]
+							pdb.set_trace()
+							best_param = P['model_params'][idx]
+						clf = sklm.Ridge(alpha=best_param)
+						pdb.set_trace()
+						clf.fit(X_train, y_train)
+						model_info[tup] = clf.get_params()
+						test_scores[tup] = clf.score(X_test, y_test)
+						print str(tup)+': '+str(test_scores[tup])
+
+	return model_info, test_scores, cv_scores
+
+
+
+
+def create_LSTM_feature_fxn(model, layer_name):
+
+	ins = [model.inputs[name].input for name in model.input_order]
+	output = model.nodes[layer_name]
+	all_out = output.get_all_outputs(False)
+	ys_test = []
+	for out in all_out:
+		ys_test.append(out)
+	pred_fxn = theano.function(inputs=ins, outputs=ys_test, allow_input_downcast=True, on_unused_input='warn')
+
+	return pred_fxn
+
+def create_LSTM_feature_fxn_only_hidden(model, layer_name):
+
+	ins = [model.inputs[name].input for name in model.input_order]
+	output = model.nodes[layer_name]
+	all_out = output.get_output(False)
+	ys_test = [all_out]
+	pred_fxn = theano.function(inputs=ins, outputs=ys_test, allow_input_downcast=True, on_unused_input='warn')
+
+	return pred_fxn
+
+
+def extract_all_model_features(feature_fxn, model, X, batch_size, is_time_expanded=False, nt=None, t_to_use=None):
+
+	ins = [X[name] for name in model.input_order]
+	nb_sample = len(ins[0])
+	outs = []
+	batches = make_batches(nb_sample, batch_size)
+	index_array = np.arange(nb_sample)
+	for batch_index, (batch_start, batch_end) in enumerate(batches):
+		print '  batch '+str(batch_index)+'/'+str(len(batches))
+		batch_ids = index_array[batch_start:batch_end]
+		ins_batch = slice_X(ins, batch_ids)
+		batch_outs = feature_fxn(*ins_batch)
+		if batch_index==0:
+			outs = []
+			for data in batch_outs:
+				if is_time_expanded:
+					if t_to_use is None:
+						s = (nb_sample, nt)+data.shape[1:]
+					else:
+						s = (nb_sample, 1)+data.shape[1:]
+				else:
+					s = (nb_sample,)+data.shape[1:]
+				outs.append(np.zeros(s).astype(np.float32))
+		for out_idx, data in enumerate(batch_outs):
+			if is_time_expanded:
+				s = data.shape
+				data = data.reshape((s[0]/nt, nt)+s[1:])
+				if t_to_use is not None:
+					data = data[:,t_to_use]
+					ds = data.shape
+					data = data.reshape( (ds[0],1) + ds[1:])
+			outs[out_idx][batch_start:batch_end] = data
+
+	return outs
+
+
+
+
+if __name__=='__main__':
+	try:
+		#run_extract_features()
+		#run_fit_features()
+		#run_full_decoding_analysis()
+		#run_run_full_decoding()
+		#run_make_epoch_plots()
+		run_tsne_plot()
+		#run_RNN_heatmap()
+		#run_make_feature_hists()
+
+	except:
+		ty, value, tb = sys.exc_info()
+		traceback.print_exc()
+		pdb.post_mortem(tb)

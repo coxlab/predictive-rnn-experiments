@@ -1,0 +1,83 @@
+import theano
+import pdb, sys, traceback, os, pickle, time
+
+import numpy as np
+import scipy.ndimage
+import matplotlib.pyplot as plt
+import hickle as hkl
+import scipy as sp
+import scipy.io as spio
+import pickle as pkl
+from scipy.misc import imread, imresize
+import pandas as pd
+
+from occluded_images_classification_FFmodels import load_KLAB325_features
+
+
+def_dir = os.path.expanduser('~/default_dir')
+sys.path.insert(0,def_dir)
+from basic_fxns import *
+
+cname = get_computer_name()
+
+sys.path.append(get_scripts_dir() +'General_Scripts/')
+from general_python_functions import libsvm_classify
+
+import general_python_functions as gp
+sys.path.append('/home/bill/Libraries/keras/')
+from keras.datasets import mnist
+from keras.utils import np_utils
+from keras.models import standardize_X, slice_X
+from keras.optimizers import *
+from keras.models import *
+from keras.layers.core import *
+from keras.layers.convolutional import *
+from keras.layers.recurrent import *
+sys.path.append('/home/bill/Libraries/keras/caffe/')
+
+sys.path.append('/home/bill/Dropbox/Cox_Lab/Predictive_Networks/scripts/')
+from prednet2 import plot_error_log
+
+
+
+def get_occlusion_params(param_overrides=None):
+
+    base_save_dir = '/home/bill/Projects/Occlusion_RNN/'
+
+    P = {}
+    P['n_orig_replicas'] = 1
+    P['nt'] = 5
+    P['batch_size'] = 128
+    P['t_val'] = range(-1,P['nt'])
+    P['C_list'] = [1e-4, 1e-3, 1e-2, 0.1, 1, 10, 100, 1e3, 1e4]
+    P['n_epochs'] = 10
+    P['fixed_W'] = True
+    P['input_once'] = False
+    P['average_loss_over_time'] = False
+    P['use_fc7_noRelu_input'] = True
+
+    P['run_num'] = gp.get_next_run_num(base_save_dir)
+    P['save_dir'] = base_save_dir + 'run_' + str(P['run_num']) + '/'
+
+
+    if param_overrides is not None:
+        for d in param_overrides:
+            P[d] = param_overrides[d]
+
+    return P
+
+
+def create_model(P):
+
+    model = Graph()
+    model.add_input(name='input', ndim=3)
+    model.add_node(SimpleRNN(4096, 4096, fixed_W=P['fixed_W'], activation='relu', return_sequences=P['average_loss_over_time']), name='RNN', input='input')
+
+    if P['average_loss_over_time']:
+        model.add_node(Reshape(4096*P['nt']), name='reshape', input='RNN')
+        out = 'reshape'
+    else:
+        out = 'RNN'
+    model.add_output(name='output', input=out)
+
+    return model

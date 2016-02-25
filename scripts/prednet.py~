@@ -1,0 +1,585 @@
+import theano
+import pdb, sys, traceback, os, pickle, time
+from keras_models import load_model, initialize_model
+
+from copy import deepcopy
+import numpy as np
+import scipy.ndimage
+import matplotlib.pyplot as plt
+import hickle as hkl
+
+if os.path.isdir('/home/bill/'):
+	sys.path.append('/home/bill/Dropbox/Cox_Lab/General_Scripts/')
+	import general_python_functions as gp
+	sys.path.append('/home/bill/Libraries/keras/')
+	from keras.datasets import mnist
+	from keras.utils import np_utils
+
+base_save_dir = '/home/bill/Projects/Predictive_Networks/mnist_runs/'
+MNIST_TRAIN_SZ = 60000
+
+def get_prednet_params(param_overrides=None):
+
+	P = {}
+	P['pred_model_name'] = 'mnist_cnn2_predictor0'
+	P['data_dir'] = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/'
+	P['frames_in_version'] = 'random'
+	P['frames_in_params'] = [10, 15]
+	P['frames_predict_ahead'] = 1
+	P['frames_predict'] = range(10, 12)
+	P['batch_size'] = 128
+	P['big_batch_size'] = 25000
+	P['epochs_per_big_batch'] = 3
+	P['nb_epoch'] = 3
+	P['n_clip_versions_to_use'] = 1
+	P['loss_function'] = 'mse'
+	P['skip_connections'] = None
+	P['horizontal_connections'] = None
+	P['optimizer'] = 'rmsprop'
+	P['n_validate'] = 10000
+	P['n_save'] = 100
+	P['n_plot'] = 10
+	P['save_model'] = True
+	P['frame_orig_size'] = 28
+	P['run_num'] = gp.get_next_run_num(base_save_dir)
+	P['save_dir'] = base_save_dir + 'run_' + str(P['run_num']) + '/'
+
+	append_params_per_model(P)
+
+	if param_overrides is not None:
+		for d in param_overrides:
+			P[d] = param_overrides[d]
+
+	return P
+
+def append_params_per_model(P):
+
+	if P['pred_model_name'] == 'mnist_cnn2_predictor0':
+		P['forward_model_name'] = 'mnist_cnn2'
+		# dictionary of forward feature layers to match and corresponding output in pred model
+		P['forward_feature_layers'] = {'dropout1': ('decoder_output', 8), 'dropout0': ('deconv0_output', 14)}
+		P['output_size'] = 26
+		P['input_layer'] = 'dropout1'
+		P['input_size'] = 8
+
+	return P
+
+
+def load_mnist():
+
+	nb_classes = 10
+
+	# the order has already been shuffled
+	(X_train, y_train), (X_test, y_test) = mnist.load_data()
+
+	X_train = X_train.reshape(X_train.shape[0], 1, 28, 28)
+	X_test = X_test.reshape(X_test.shape[0], 1, 28, 28)
+	X_train = X_train.astype("float32")
+	X_test = X_test.astype("float32")
+	X_train /= 255
+	X_test /= 255
+
+	# convert class vectors to binary class matrices
+	y_train = np_utils.to_categorical(y_train, nb_classes)
+	y_test = np_utils.to_categorical(y_test, nb_classes)
+
+	return (X_train, y_train), (X_test, y_test)
+
+
+def create_rotation_clip(orig_im, center_x, center_y, theta0, angular_speed, n_frames):
+
+	clip = np.zeros((n_frames, orig_im.shape[0], orig_im.shape[1]))
+	for i in range(n_frames):
+		clip[i] = rotate_image(orig_im, theta0+i*angular_speed, center_x, center_y)
+
+	return clip
+
+
+def generate_clip_set(orig_ims, n_frames):
+
+	n_ims = orig_ims.shape[0]
+	nx = orig_ims.shape[2]
+	clip_frames = np.zeros((n_ims, n_frames, 1, 28, 28))
+
+	for i in range(n_ims):
+		center_x = np.random.randint(int(np.round(3*float(nx)/8)), 1+int(np.round(float(5*nx)/8)))
+		center_y = np.random.randint(int(np.round(3*float(nx)/8)), 1+int(np.round(float(5*nx)/8)))
+		theta0 = 0.0
+		angular_speed = np.random.uniform(-np.pi/6, np.pi/6)
+		clip_frames[i,:,0] = create_rotation_clip(orig_ims[i,0], center_x, center_y, theta0, angular_speed, n_frames)
+		if i%100==0:
+			print 'Done clip '+str(i+1)+'/'+str(n_ims)
+
+	return clip_frames
+
+
+def rotate_image(im, theta, center_x, center_y, threshold = 0.01):
+
+	h = im.shape[0]
+	n = np.ceil(h*np.sqrt(2))
+	dh = np.ceil((n-h)/2)
+	im_large = np.zeros((h+2*n, h+2*n))
+	im_large[dh:dh+h,dh:dh+h] = im
+	im_rotated = np.zeros((h+2*n, h+2*n))
+	R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+	for i in range(im.shape[0]):
+		dx = i-center_x
+		for j in range(im.shape[1]):
+			dy = j-center_y
+			dv = np.array([[dx], [dy]])
+			v = np.dot(R, dv)
+			y = center_y+v[1]
+			x = center_x+v[0]
+			i_low = int(np.floor(x))
+			i_high = int(np.ceil(x))
+			di = x - i_low
+			j_low = int(np.floor(y))
+			j_high = int(np.ceil(y))
+			dj = y - j_low
+			if di<0.5 and dj<0.5:
+				v1 = im_large[dh+i_low, dh+j_low]
+				v2 = im_large[dh+i_high, dh+j_low]
+				v3 = im_large[dh+i_low, dh+j_high]
+				val = v1+di*(v2-v1)+dj*(v3-v1)
+			elif di<0.5 and dj>=0.5:
+				v1 = im_large[dh+i_low, dh+j_high]
+				v2 = im_large[dh+i_low, dh+j_low]
+				v3 = im_large[dh+i_high, dh+j_high]
+				val = v1+di*(v2-v1)+(1-dj)*(v3-v1)
+			elif di>=0.5 and dj<0.5:
+				v1 = im_large[dh+i_high, dh+j_low]
+				v2 = im_large[dh+i_low, dh+j_low]
+				v3 = im_large[dh+i_high, dh+j_high]
+				val = v1+(1-di)*(v2-v1)+dj*(v3-v1)
+			else:
+				v1 = im_large[dh+i_high, dh+j_high]
+				v2 = im_large[dh+i_low, dh+j_high]
+				v3 = im_large[dh+i_high, dh+j_low]
+				val = v1+(1-di)*(v2-v1)+(1-dj)*(v3-v1)
+			im_rotated[dh+i,dh+j]= val
+
+	im_rotated = im_rotated[dh:dh+h,dh:dh+h]
+	im_rotated[im_rotated<threshold] = 0
+
+	return im_rotated
+
+
+def run_generate_clips():
+
+	n_frames = 20
+	base_folder = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/'
+	n_clips_per_block = 10000
+	clip_versions = [2]
+
+	X = {}
+	(X['train'], _), (X['test'], _) = load_mnist()
+
+	for t in ['train','test']:
+		for i in clip_versions:
+			for j in range(X[t].shape[0]/n_clips_per_block):
+				clip_frames = generate_clip_set(X[t][j*n_clips_per_block:(j+1)*n_clips_per_block], n_frames)
+				if clip_frames.shape[0]!=n_clips_per_block:
+					raise Exception('Clips arent lined up!')
+				fname = base_folder + 'mnist_rotations_'+t+'_block'+str(j)+'_clips'+str(i)+'.hkl'
+				hkl.dump(clip_frames, fname, mode='w')
+
+def get_block_num_timesteps(P):
+
+	if P['frames_in_version'] == 'random':
+		nt = np.random.randint(P['frames_in_params'][0], P['frames_in_params'][1])
+
+	return nt
+
+def get_val_idx(P):
+
+	val_idx = []
+	for j in range(P['n_clip_versions_to_use']):
+		start_i = (j+1)*MNIST_TRAIN_SZ-P['n_validate']
+		end_i = start_i + P['n_validate']
+		val_idx.extend([i for i in range(start_i, end_i)])
+
+	return val_idx
+
+
+def get_block_idxs(P):
+
+	n_ex = P['n_clip_versions_to_use']*MNIST_TRAIN_SZ
+	all_idx = set([i for i in range(n_ex)])
+	if P['n_validate'] != 0:
+		all_idx = all_idx - set(get_val_idx(P))
+
+	all_idx = np.random.permutation(list(all_idx))
+	idxs = []
+	n_blocks = int(np.ceil(float(len(all_idx))/P['big_batch_size']))
+	for j in range(n_blocks):
+		start_i = j*P['big_batch_size']
+		if j==n_blocks:
+			end_i = len(all_idx)
+		else:
+			end_i = (j+1)*P['big_batch_size']
+		idxs.append(all_idx[start_i:end_i])
+	#pdb.set_trace()
+
+	return idxs
+
+
+
+def run_prednet(param_overrides=None):
+
+	P = get_prednet_params(param_overrides)
+
+	forward_model = load_model(P['forward_model_name'])
+
+	model = initialize_model(P['pred_model_name'])
+	out_dict = {'prediction_output': P['loss_function']}
+	for layer in P['forward_feature_layers']:
+		out_dict[P['forward_feature_layers'][layer][0]] = P['loss_function']
+	print 'Compiling Model...'
+	model.compile(P['optimizer'], out_dict)
+
+	for epoch in range(P['nb_epoch']):
+		t_epoch_start = time.time()
+		print 'Starting Epoch: '+str(epoch)
+		block_idxs = get_block_idxs(P)
+		for b,idx in enumerate(block_idxs):
+			t_b_start = time.time()
+			print '   Batch: '+str(b)
+			nt = get_block_num_timesteps(P)
+			print '     Loading Input Features'
+			t0 = time.time()
+			input_features = load_features_mnist(P['data_dir'], P['forward_model_name'], P['input_layer'], P['input_size'], range(nt), idx)
+			print '         time elapsed: '+str(np.round(time.time()-t0)) +' seconds'
+			predict_features = {}
+			for layer in P['forward_feature_layers']:
+				sz = P['forward_feature_layers'][layer][1]
+				print '     Loading '+layer+' Features'
+				t0 = time.time()
+				predict_features[layer] = load_features_mnist(P['data_dir'], P['forward_model_name'], layer, sz, nt, idx)
+				print '         time elapsed: '+str(np.round(time.time()-t0)) +' seconds'
+			predict_frames = flatten_features(load_frames(P['data_dir'], P['output_size'], nt, idx))
+			data = {'input': input_features, 'prediction_output': predict_frames}
+			for layer in P['forward_feature_layers']:
+				data[P['forward_feature_layers'][layer][0]] = predict_features[layer]
+			print '     Fitting Batch'
+			t0 = time.time()
+			model.fit(data, batch_size=P['batch_size'], nb_epoch=1, verbose=1)
+			print '         time elapsed: '+str(np.round(time.time()-t0)) +' seconds'
+			print '  time to fit batch: '+str(np.round(time.time()-t_b_start))
+			del input_features, predict_features, predict_frames, data
+		print ' time for epoch: '+str(np.round(time.time()-t_epoch_start))
+
+	val_idx = get_val_idx(P)
+	val_idx = val_idx[:P['n_save']]
+	n_val = len(val_idx)
+	true_features = load_features_mnist(P['data_dir'], P['forward_model_name'], P['input_layer'], P['input_size'], range(P['frames_predict'][0]), val_idx)
+	pred_features = np.zeros((n_val, P['frames_predict'][-1]-1, true_features.shape[-1]))
+	pred_features[:,:P['frames_predict'][0]] = true_features
+	predictions = np.zeros((n_val, len(P['frames_predict']), 1, P['output_size'], P['output_size']))
+	del true_features
+	for i,t in enumerate(P['frames_predict']):
+		y_hat = model.predict({'input': pred_features[:,:t]})['prediction_output'].reshape( (n_val, 1, P['output_size'], P['output_size']) )
+		predictions[:,i] = y_hat
+		# append to pred_featur
+		if P['output_size'] != P['frame_orig_size']:
+			next_frames = resize_image_stack(y_hat, P['frame_orig_size'])
+		else:
+			next_frames = y_hat
+		pred_features[:,t] = extract_features_graph(forward_model, P['input_layer'], {'input': next_frames})[P['input_layer']]
+	actual_frames = load_frames(P['data_dir'], P['output_size'], P['frames_predict'], val_idx)
+
+	os.mkdir(P['save_dir'])
+
+	f = open(P['save_dir' + 'params.pkl'], 'w')
+	pickle.dump(P, f)
+	f.close()
+
+	f = open(P['save_dir' + 'predictions.pkl'], 'w')
+	pickle.dump([predictions, actual_frames, val_idx], f)
+	f.close()
+
+	if P['save_weights']:
+		model.save_weights(P['save_dir']+'model_weights.hdf5')
+
+	if P['n_plot'] != 0:
+		print 'Making Plots'
+		pic_save_dir = P['save_dir'] + 'images/'
+		title_str = 'Run '+str(P['run_num'])
+		for i,t in enumerate(P['frames_predict']):
+			tags = []
+			for k in range(P['n_plot']):
+				tags.append('im'+str(val_idx[k]+'_t'+str(t)))
+			plot_mnist_prediction_results(actual_frames[:P['n_plot'],i], predictions[:P['n_plot'],i], pic_save_dir, tags, title_str)
+
+
+def load_features_mnist(base_dir, model_name, layer, size, time_steps, idx):
+
+	if not isinstance(time_steps, list):
+		time_steps = [time_steps]
+
+	feat_dir = base_dir + 'model_features/'+model_name+'/'+layer+'/size_'+str(size)+'/'
+	idx = np.array(idx)
+	for t_idx, t in enumerate(time_steps):
+
+		if layer=='dropout1':
+			fname = feat_dir + 'features_'+str(t)+'.hkl'
+			f = open(fname, 'r')
+			these_features = hkl.load(f)[idx]
+			f.close()
+		elif layer=='dropout0':
+			initialized = False
+			for i in range(9):
+				in_batch = np.nonzero(np.logical_and(idx>=i*20000, idx<(i+1)*20000))[0]
+				if len(in_batch)>0:
+					fname = feat_dir + 'features_'+str(t)+'_20000_'+str(i)+'.hkl'
+					f = open(fname, 'r')
+					these_f = hkl.load(f)
+					f.close()
+					this_idx = idx[in_batch] - i*20000
+					these_f = these_f[this_idx]
+					if not initialized:
+						these_features = np.zeros((len(idx), these_f.shape[-1])).astype(np.float32)
+						initialized = True
+					these_features[in_batch] = these_f
+
+		if len(time_steps)==1:
+			features = these_features
+		else:
+			if t_idx==0:
+				features = np.zeros((len(idx), len(time_steps), these_features.shape[-1]))
+			features[:,t_idx] = these_features
+
+	return features
+
+
+def load_frames(base_dir, frame_size, time_steps, idx):
+
+	if not isinstance(time_steps, list):
+		time_steps = [time_steps]
+
+	frame_dir = base_dir + 'single_frames/size_'+str(frame_size)+'/'
+	for i,t in enumerate(time_steps):
+		fname = frame_dir + 'frame_'+str(t)+'.hkl'
+		f = open(fname, 'r')
+		these_frames = hkl.load(f)[idx]
+		f.close()
+		if len(time_steps)==1:
+			return these_frames
+		else:
+			if i==0:
+				s = these_frames.shape
+				frames = np.zeros((len(idx), len(time_steps), s[1], s[2], s[3]))
+			frames[:,i] = these_frames
+
+	return frames
+
+
+def load_test():
+
+	fname = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/mnist_rotations_train_block0_clips1.hkl'
+	f = open(fname, 'r')
+
+	t0 = time.time()
+	vals = hkl.load(f)
+	print 'Time to load 10k using hkl: '+str(time.time()-t0)
+	f.close()
+
+	fname = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/mnist_rotations_train_block0_clips3.hkl'
+	f = open(fname, 'r')
+
+	t0 = time.time()
+	vals2 = hkl.load(f)
+	print 'Time to load 10k using hkl: '+str(time.time()-t0)
+	f.close()
+
+	pdb.set_trace()
+
+def split_data():
+
+	# for each of features and frames, split into chunks for easy training
+	block_size = 25000
+	n_validate = 10000
+	model_name = 'mnist_cnn2'
+	# block size, n_validate and num clip versions dictate sets
+	# will be like features_[time_step]_block0_version
+	layers = {'dropout0': 14, 'dropout1': 8}
+	layers = {'dropout1': 8}
+	frame_sizes = [26, 28]
+	#layers = {}
+	frame_sizes = []
+	#layers = {'dropout0': 14}
+	if len(layers)>0:
+		for l in layers:
+			out_dir = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/model_features/'+model_name+'/'+l+'/size_'+str(layers[l])+'/blocksize_'+str(block_size)+'_nval_'+str(n_validate)+'/'
+			if not os.path.exists(out_dir):
+				os.mkdir(out_dir)
+			for t in range(10):
+				for v in range(3):
+					for b in range(2):
+						idx = [i+v*MNIST_TRAIN_SZ+b*block_size for i in range(block_size)]
+						features = load_features_mnist('/home/bill/Data/MNIST/Rotation_Clips/clip_set1/', model_name, l, layers[l], t, idx)
+						fname = out_dir + 'features_t'+str(t)+'_block'+str(b)+'_version'+str(v)+'.hkl'
+						print fname
+						f = open(fname, 'w')
+						hkl.dump(features, f)
+
+	if len(frame_sizes)>0:
+		for s in frame_sizes:
+			out_dir = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/single_frames/size_'+str(s)+'/blocksize_'+str(block_size)+'_nval_'+str(n_validate)+'/'
+			if not os.path.exists(out_dir):
+				os.mkdir(out_dir)
+			for t in range(20):
+				for v in range(3):
+					for b in range(2):
+						idx = [i+v*MNIST_TRAIN_SZ+b*block_size for i in range(block_size)]
+						frames = load_frames('/home/bill/Data/MNIST/Rotation_Clips/clip_set1/', s, t, idx)
+						fname = out_dir + 'frames_t'+str(t)+'_block'+str(b)+'_version'+str(v)+'.hkl'
+						print fname
+						f = open(fname, 'w')
+						hkl.dump(frames, f)
+
+def save_single_frames():
+
+	n_versions = 3
+	output_size = 28
+	n_blocks = 6
+
+	out_folder = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/single_frames/size_'+str(output_size)+'/'
+	if not os.path.exists(out_folder):
+		os.mkdir(out_folder)
+
+	for i in range(13,20):
+		print 'Starting frame '+str(i)
+		counter = 0
+		all_frames = np.zeros((60000*n_versions, 1, output_size, output_size))
+		for j in range(n_versions):
+			for k in range(n_blocks):
+				fname = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/mnist_rotations_train_block'+str(k)+'_clips'+str(j)+'.hkl'
+				f = open(fname, 'r')
+				these_frames = hkl.load(f)
+				f.close()
+				s = np.shape(these_frames)
+				these_frames = np.reshape(these_frames[:,i], (s[0], s[2], s[3], s[4]))
+				if these_frames.shape[-1] != output_size:
+					all_frames[counter:counter+s[0]] = resize_image_stack(these_frames, output_size)
+				counter += s[0]
+				print counter
+		fname = out_folder+'frame_'+str(i)+'.hkl'
+		f = open(fname, 'w')
+		hkl.dump(all_frames, f)
+
+def flatten_features(X):
+	size = np.prod(X.shape)/X.shape[0]
+	return X.reshape( (X.shape[0], size) )
+
+def save_model_features():
+
+	# features are calculated from original image size
+	model_name = 'mnist_cnn2'
+	#layers = ['dropout1']
+	#sizes = [8]
+	#t_steps = range(10)
+	layers = ['dropout0']
+	sizes = [14]
+	t_steps = range(10, 20)
+	#layers = ['flatten0']
+	#sizes = [None]
+	#t_steps = range(20)
+	d_dir = '/home/bill/Data/MNIST/Rotation_Clips/clip_set1/'
+	frames_dir = d_dir+'single_frames/size_28/'
+	batch_size = 20000
+
+	model = load_model(model_name)
+
+	for i,l in enumerate(layers):
+		for t in t_steps:
+			print 'Layer '+l+' time '+str(t)
+			fname = frames_dir+'frame_'+str(t)+'.hkl'
+			f = open(fname, 'r')
+			frames = hkl.load(f)
+			f.close()
+			# frames will be (n_clips, 1, 28, 28)
+			for j in range(frames.shape[0]/batch_size):
+				features = extract_features_graph(model, l, {'input': frames[j*batch_size:(j+1)*batch_size]})[l]
+				if sizes[i] is not None:
+					if sizes[i] != features.shape[-1]:
+						features = resize_image_stack(features, sizes[i])
+				features = flatten_features(features)
+				print features.shape
+				out_dir = d_dir+'model_features/'+model_name+'/'+l+'/size_'+str(sizes[i])+'/'
+				if not os.path.exists(out_dir):
+					os.makedirs(out_dir)
+				fname = out_dir+'features_'+str(t)+'_'+str(batch_size)+'_'+str(j)+'.hkl'
+				f = open(fname, 'w')
+				hkl.dump(features, f)
+				f.close()
+
+
+
+# X looks like {'input': X_train}
+def extract_features_graph(model, layer_names, X):
+
+	model2 = deepcopy(model)
+
+	if not isinstance(layer_names, list):
+		layer_names = [layer_names]
+
+	for i,l_name in enumerate(layer_names):
+		n = 'out'+str(i)
+		model2.add_output(name=n, input=l_name)
+
+	ins = [model2.inputs[name].input for name in model2.input_order]
+	ys_test = []
+	for output_name in model2.output_order:
+		output = model2.outputs[output_name]
+		y_test = output.get_output(False)
+		ys_test.append(y_test)
+	model2._predict = theano.function(inputs=ins, outputs=ys_test, allow_input_downcast=True)
+	outs = model2.predict(X)
+	outputs = {}
+	for i,l_name in enumerate(layer_names):
+		outputs[l_name] = outs['out'+str(i)]
+
+	return outputs
+
+def resize_image_stack(im_stack, size, threshold = 0.01):
+
+	imstack_resampled = np.zeros((im_stack.shape[0], im_stack.shape[1], size, size)).astype(np.float32)
+	for i in range(im_stack.shape[0]):
+		for j in range(im_stack.shape[1]):
+			im = scipy.ndimage.zoom(im_stack[i,j], float(size)/im_stack.shape[2])
+			im[im<threshold] = 0
+			imstack_resampled[i,j]= im
+
+	return imstack_resampled
+
+
+def plot_mnist_prediction_results(y, y_hat, save_dir, tags, title_str):
+
+	if not os.path.exists(save_dir):
+		os.mkdir(save_dir)
+
+	plt.figure()
+	for i in range(y.shape[0]):
+		plt.subplot(1, 2, 1)
+		plt.imshow(y[i,0])
+		plt.xlabel('Original')
+		plt.title(title_str)
+
+		plt.subplot(1, 2, 2)
+		plt.imshow(y_hat[i,0])
+		plt.xlabel('Reconstructed')
+		plt.title(tags[i])
+
+		plt.savefig(save_dir + tags[i] + '.jpg')
+
+
+if __name__=='__main__':
+	try:
+		#run_generate_clips()
+		#load_test()
+		#run_prednet()
+		split_data()
+	except:
+		ty, value, tb = sys.exc_info()
+		traceback.print_exc()
+		pdb.post_mortem(tb)
